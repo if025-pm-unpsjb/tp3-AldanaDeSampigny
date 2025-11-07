@@ -11,6 +11,7 @@
 /* FreeRTOS */
 #include "FreeRTOS.h"
 #include "task.h"
+#include "semphr.h" // Incluido para el uso de semáforos binarios
 
 /* Standard includes. */
 #include <stdio.h>
@@ -32,17 +33,21 @@
 /*-----------------------------------------------------------*/
 
 /* Dimensions the buffer for text messages. */
-#define mainMAX_MSG_LEN                     25
+#define mainMAX_MSG_LEN 					25
 
 /* Constants used when writing strings to the display. */
-#define mainCHARACTER_HEIGHT                ( 9 )
-#define mainMAX_ROWS_128                    ( mainCHARACTER_HEIGHT * 14 )
-#define mainMAX_ROWS_96                     ( mainCHARACTER_HEIGHT * 10 )
-#define mainMAX_ROWS_64                     ( mainCHARACTER_HEIGHT * 7 )
-#define mainFULL_SCALE                      ( 15 )
-#define ulSSI_FREQUENCY                     ( 3500000UL )
+#define mainCHARACTER_HEIGHT 				( 9 )
+#define mainMAX_ROWS_128 					( mainCHARACTER_HEIGHT * 14 )
+#define mainMAX_ROWS_96 					( mainCHARACTER_HEIGHT * 10 )
+#define mainMAX_ROWS_64 					( mainCHARACTER_HEIGHT * 7 )
+#define mainFULL_SCALE 						( 15 )
+#define ulSSI_FREQUENCY 					( 3500000UL )
 
-int sistema = 10;
+// Definición del sistema para la Inversión de Prioridad
+#define mainPRIO_INV_SYSTEM ( 99 )
+
+
+int sistema = mainPRIO_INV_SYSTEM;
 
 /*-----------------------------------------------------------*/
 
@@ -62,9 +67,17 @@ static void prvPrintString( const char * pcString );
 static void vBusyWait( TickType_t ticks );
 
 /*
- * Periodic task.
+ * Periodic task (función original).
  */
 static void prvTask( void* pvParameters );
+
+/*
+ * Prototipos para la Inversión de Prioridad.
+ */
+static void prvTaskLow( void* pvParameters );
+static void prvTaskMedium( void* pvParameters );
+static void prvTaskHigh( void* pvParameters );
+static void prvCreatePriorityInversionTasks( void );
 
 /*-----------------------------------------------------------*/
 
@@ -75,6 +88,9 @@ void ( *vOLEDStringDraw )( const char *, uint32_t, uint32_t, unsigned char ) = N
 void ( *vOLEDImageDraw )( const unsigned char *, uint32_t, uint32_t, uint32_t, uint32_t ) = NULL;
 void ( *vOLEDClear )( void ) = NULL;
 
+/* Handle global para el semáforo binario (el recurso compartido). */
+static SemaphoreHandle_t xBinarySemaphore = NULL;
+
 /*-----------------------------------------------------------*/
 
 struct xTaskStruct {
@@ -84,91 +100,176 @@ struct xTaskStruct {
 
 typedef struct xTaskStruct xTask;
 
-// TAREAS TP2 (WCET, PERIODO) EN MILISEGUNDOS
-// Los períodos han sido ajustados para que la prioridad RM (T1 > T2 > T3...) sea válida.
 
-// Sistema 1: S(3) = {(1, 4, 4), (1, 5, 5), (2, 8, 8)}
 xTask tasks1[] = {
-	{ 1000, 4000 }, // T1: Periodo más corto = Mayor prioridad
-	{ 1000, 5000 }, // T2
-	{ 2000, 8000 }  // T3: Periodo más largo = Menor prioridad
+	{ 1000, 4000 },
+	{ 1000, 5000 },
+	{ 2000, 8000 }
 };
 
-// Sistema 2: S(3) = {(1, 4, 4), (1, 8, 8), (2, 9, 9)}
 xTask tasks2[] = {
-	{ 1000, 4000 }, // T1
-	{ 1000, 8000 }, // T2
-	{ 2000, 9000 }  // T3
+	{ 1000, 4000 },
+	{ 1000, 8000 },
+	{ 2000, 9000 }
 };
 
-// Sistema 3: S(4) = {(1, 4, 4), (1, 6, 6), (1, 8, 8), (3, 13, 13)}
+
 xTask tasks3[] = {
-	{ 1000, 4000 }, // T1
-	{ 1000, 6000 }, // T2
-	{ 1000, 8000 }, // T3
-	{  3000, 13000 } // T4
+	{ 1000, 4000 },
+	{ 1000, 6000 },
+	{ 1000, 8000 },
+	{ 3000, 13000 }
 };
 
-// Sistema 4: S(4) = {(1, 4, 4), (2, 7, 7), (1, 12, 12), (2, 14, 14)}
 xTask tasks4[] = {
-	{ 1000, 4000 }, // T1
-	{ 2000, 7000 }, // T2
-	{ 1000, 12000 }, // T3
-	{2000, 14000 }  // T4
+	{ 1000, 4000 },
+	{ 2000, 7000 },
+	{ 1000, 12000 },
+	{2000, 14000 }
 };
 
-// Sistema 5: S(5) = {(1, 5, 5), (1, 9, 9), (1, 10, 10), (2, 15, 15), (2, 16, 16)}
+
 xTask tasks5[] = {
-	{ 1000, 5000 }, // T1
-	{ 1000, 9000 }, // T2
-	{ 1000, 10000 }, // T3
-	{2000, 15000 }, // T4
-	{ 2000, 16000 } // T5
+	{ 1000, 5000 },
+	{ 1000, 9000 },
+	{ 1000, 10000 },
+	{2000, 15000 },
+	{ 2000, 16000 }
 };
 
-// Sistema 6: S(5) = {(1, 6, 6), (1, 8, 8), (2, 11, 11), (1, 15, 15), (2, 17, 17)}
 xTask tasks6[] = {
-	{ 1000, 6000 }, // T1
-	{ 1000, 8000 }, // T2
+	{ 1000, 6000 },
+	{ 1000, 8000 },
 	{ 2000, 11000 },
-	{ 1000, 15000 }, // T4
-	{2000, 17000 }  // T5
+	{ 1000, 15000 },
+	{2000, 17000 }
 };
 
-// Sistema 7: S(4) = {(1, 4, 4), (1, 7, 7), (2, 10, 10), (2, 14, 14)}
 xTask tasks7[] = {
-	{ 1000, 4000 }, // T1
-	{ 1000, 7000 }, // T2
-	{ 2000, 10000 }, // T3
-	{2000, 14000 }  // T4
+	{ 1000, 4000 },
+	{ 1000, 7000 },
+	{ 2000, 10000 },
+	{2000, 14000 }
 };
 
-// Sistema 8: S(4) = {(1, 4, 4), (1, 8, 8), (2, 10, 10), (2, 14, 14)}
 xTask tasks8[] = {
-	{ 1000, 4000 }, // T1
-	{ 1000, 8000 }, // T2
-	{ 2000, 10000 }, // T3
-	{2000, 14000 }  // T4
+	{ 1000, 4000 },
+	{ 1000, 8000 },
+	{ 2000, 10000 },
+	{2000, 14000 }
 };
 
-// Sistema 9: S(5) = {(1, 5, 5), (1, 8, 8), (2, 12, 12), (1, 15, 15), (1, 16, 16)}
 xTask tasks9[] = {
-	{ 1000, 5000 }, // T1
-	{ 1000, 8000 }, // T2
-	{ 2000, 12000 }, // T3
-	{1000, 15000 }, // T4
-	{ 1000, 16000 } // T5
+	{ 1000, 5000 },
+	{ 1000, 8000 },
+	{ 2000, 12000 },
+	{1000, 15000 },
+	{ 1000, 16000 }
 };
 
-// Sistema 10: S(5) = {(1, 5, 5), (1, 8, 8), (1, 12, 12), (1, 13, 13), (2, 16, 16)}
 xTask tasks10[] = {
-	{ 1000, 5000 }, // T1
-	{ 1000, 8000 }, // T2
-	{ 1000, 12000 }, // T3
-	{1000, 13000 }, // T4
-	{ 2000, 16000 } // T5
+	{ 1000, 5000 },
+	{ 1000, 8000 },
+	{ 1000, 12000 },
+	{1000, 13000 },
+	{ 2000, 16000 }
 };
 
+
+static void prvTaskLow( void *pvParameters )
+{
+	(void) pvParameters;
+	vTaskDelay( pdMS_TO_TICKS( 100 ) );
+
+	for( ;; )
+	{
+		prvPrintString( "TL: Intentando tomar semaforo...\n\r" );
+
+
+		if( xSemaphoreTake( xBinarySemaphore, portMAX_DELAY ) == pdPASS )
+		{
+			prvPrintString( "TL: Semáforo tomado. Entrando a seccion critica.\n\r" );
+
+			prvPrintString( "TL: Ejecutando trabajo critico (3000ms)..\n\r" );
+			vBusyWait( pdMS_TO_TICKS( 3000 ) );
+
+			prvPrintString( "TL: Saliendo de seccion critica.\n\r" );
+
+
+			xSemaphoreGive( xBinarySemaphore );
+			prvPrintString( "TL: Semáforo liberado.\n\r" );
+		}
+
+
+		vTaskDelay( pdMS_TO_TICKS( 5000 ) );
+	}
+}
+
+
+static void prvTaskMedium( void *pvParameters )
+{
+	(void) pvParameters;
+	vTaskDelay( pdMS_TO_TICKS( 500 ) );
+
+	for( ;; )
+	{
+
+		prvPrintString( "TM: Ejecutando trabajo (2000ms) \n\r" );
+		vBusyWait( pdMS_TO_TICKS( 2000 ) );
+
+
+		prvPrintString( "TM: Terminado. Durmiendo.\n\r" );
+		vTaskDelay( pdMS_TO_TICKS( 2000 ) );
+	}
+}
+
+static void prvTaskHigh( void *pvParameters )
+{
+	(void) pvParameters;
+
+	vTaskDelay( pdMS_TO_TICKS( 200 ) );
+
+	for( ;; )
+	{
+		prvPrintString( "TH: Intentando tomar semaforo (ALTA PRIORIDAD).\n\r" );
+
+
+		if( xSemaphoreTake( xBinarySemaphore, portMAX_DELAY ) == pdPASS )
+		{
+
+			prvPrintString( "TH: Semáforo tomado. Corriendo muy brevemente.\n\r" );
+			vBusyWait( pdMS_TO_TICKS( 500 ) );
+
+
+			xSemaphoreGive( xBinarySemaphore );
+			prvPrintString( "TH: Semáforo liberado. Durmiendo largo tiempo.\n\r" );
+		}
+
+		vTaskDelay( pdMS_TO_TICKS( 8000 ) );
+	}
+}
+
+static void prvCreatePriorityInversionTasks( void )
+{
+	xBinarySemaphore = xSemaphoreCreateBinary();
+
+	if ( xBinarySemaphore != NULL )
+	{
+
+		xTaskCreate( prvTaskHigh, "TH-High", configMINIMAL_STACK_SIZE + 50, NULL, tskIDLE_PRIORITY + 3, NULL );
+
+		xTaskCreate( prvTaskMedium, "TM-Medium", configMINIMAL_STACK_SIZE + 50, NULL, tskIDLE_PRIORITY + 2, NULL );
+
+
+		xTaskCreate( prvTaskLow, "TL-Low", configMINIMAL_STACK_SIZE + 50, NULL, tskIDLE_PRIORITY + 1, NULL );
+
+		xSemaphoreGive( xBinarySemaphore );
+
+		prvPrintString( "Demo Inversion de Prioridad: Tareas creadas (TH > TM > TL).\n\r" );
+	} else {
+		prvPrintString( "ERROR: No se pudo crear el semáforo.\n\r" );
+	}
+}
 
 /*************************************************************************
  * Main
@@ -191,68 +292,71 @@ int main( void )
     /* Initialise the OLED and display a startup message. */
     vOLEDInit( ulSSI_FREQUENCY );
 
-    /* Print Hello World! to the OLED display. */
+    /* Print startup message to the OLED display. */
     static char cMessage[ mainMAX_MSG_LEN ];
-    sprintf(cMessage, "Hello World!");
+	if (sistema == mainPRIO_INV_SYSTEM) {
+    	sprintf(cMessage, "Prio. Inv. Demo!");
+    } else {
+    	sprintf(cMessage, "Sistema %d", sistema);
+    }
     vOLEDStringDraw( cMessage, 0, 0, mainFULL_SCALE );
 
     /* Print "Start!" to the UART. */
     prvPrintString("Start!\n\r");
 
-    xTask *tasksSistema = NULL;
-    	int numTasks = 0;
 
-    	if (sistema == 1) {
-    		tasksSistema = tasks1;
-    		numTasks = 3;
-    	} else if (sistema == 2){
-    		tasksSistema = tasks2;
-    		numTasks = 3;
-    	} else if (sistema == 3){
-    	   tasksSistema = tasks3;
-    	   numTasks = 4;
-    	} else if (sistema == 4) {
-    		tasksSistema = tasks4;
-    		numTasks = 4;
-    	} else if (sistema == 5) {
-    	    tasksSistema = tasks5;
-    	    numTasks = 5;
-    	} else if (sistema == 6) {
-    	    tasksSistema = tasks6;
-    	    numTasks = 5;
-    	} else if (sistema == 7) {
-    	    tasksSistema = tasks7;
-    	    numTasks = 4;
-    	    printf("Mi edad es: %d anios.\n", numTasks);
-    	} else if (sistema == 8) {
-    	    tasksSistema = tasks8;
-    	    numTasks = 4;
-    	} else if (sistema == 9) {
-    	    tasksSistema = tasks9;
-    	    numTasks = 5;
-    	} else if (sistema == 10){
-    	    tasksSistema = tasks10;
-    	    numTasks = 5;
-    	} else {
 
-        }
+	if (sistema == mainPRIO_INV_SYSTEM) {
+		prvCreatePriorityInversionTasks();
+	} else {
+		xTask *tasksSistema = NULL;
+		int numTasks = 0;
 
-    	char taskName[6];
+		if (sistema == 1) {
+			tasksSistema = tasks1;
+			numTasks = 3;
+		} else if (sistema == 2){
+			tasksSistema = tasks2;
+			numTasks = 3;
+		} else if (sistema == 3){
+			tasksSistema = tasks3;
+			numTasks = 4;
+		} else if (sistema == 4) {
+			tasksSistema = tasks4;
+			numTasks = 4;
+		} else if (sistema == 5) {
+			tasksSistema = tasks5;
+			numTasks = 5;
+		} else if (sistema == 6) {
+			tasksSistema = tasks6;
+			numTasks = 5;
+		} else if (sistema == 7) {
+			tasksSistema = tasks7;
+			numTasks = 4;
+		} else if (sistema == 8) {
+			tasksSistema = tasks8;
+			numTasks = 4;
+		} else if (sistema == 9) {
+			tasksSistema = tasks9;
+			numTasks = 5;
+		} else if (sistema == 10){
+			tasksSistema = tasks10;
+			numTasks = 5;
+		} else {
+			prvPrintString("ERROR: Sistema no reconocido.\n\r");
+		}
 
-    	for (int indice = 0; indice < numTasks; indice++) {
+		char taskName[6];
 
-            sprintf(taskName, "T%d", indice + 1);
-    		xTaskCreate(prvTask, (const char*) taskName,
-    		            configMINIMAL_STACK_SIZE + 50,
-    		            (void*) &tasksSistema[indice],
-						 configMAX_PRIORITIES - (indice + 1),
-                        NULL);
-    	}
-
-    /* Creates the periodic tasks. */
-    //xTaskCreate( prvTask, "T1", configMINIMAL_STACK_SIZE + 50, (void*) &task1, configMAX_PRIORITIES - 1, NULL );
-    //xTaskCreate( prvTask, "T2", configMINIMAL_STACK_SIZE + 50, (void*) &task2, configMAX_PRIORITIES - 2, NULL );
-    //xTaskCreate( prvTask, "T3", configMINIMAL_STACK_SIZE + 50, (void*) &task3, configMAX_PRIORITIES - 3, NULL );
+		for (int indice = 0; indice < numTasks; indice++) {
+			sprintf(taskName, "T%d", indice + 1);
+			xTaskCreate(prvTask, (const char*) taskName,
+						configMINIMAL_STACK_SIZE + 50,
+						(void*) &tasksSistema[indice],
+						configMAX_PRIORITIES - (indice + 1),
+						NULL);
+		}
+	}
 
     vTraceEnable( TRC_START );
 
@@ -315,14 +419,15 @@ void prvTask( void *pvParameters )
 	TickType_t pxPreviousWakeTime = 0;
 	xTask *task = (xTask*) pvParameters;
 
+	pxPreviousWakeTime = xTaskGetTickCount();
+
 	for( ;; )
 	{
         sprintf( cMessage, "%s - %u\n\r", pcTaskGetTaskName( NULL ), uxReleaseCount );
 
         prvPrintString( cMessage );
 
-        vBusyWait( task->wcet-100);
-
+		vBusyWait( task->wcet);
 		vTaskDelayUntil( &pxPreviousWakeTime, task->period );
 
 		uxReleaseCount += 1;
